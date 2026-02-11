@@ -1,4 +1,4 @@
-import datetime as _dt
+﻿import datetime as _dt
 import gc
 import json
 import math
@@ -21,7 +21,7 @@ LOCAL_CACHE_DIR = DATA_DIR / "_cache"
 RELS_CACHE_SCHEMA_VERSION = 2
 TIMELINE_MAX_YEAR = 2025
 
-st.set_page_config(page_title="NPW Org-Chart Explorer", layout="wide")
+st.set_page_config(page_title="BHC Org-Chart Explorer", layout="wide")
 
 # ----------------------------
 # Utility functions
@@ -45,7 +45,7 @@ def _read_zip_csv(zip_path: Path) -> pd.DataFrame:
             return pd.read_csv(f, low_memory=False)
 
 
-@st.cache_data(show_spinner=False, max_entries=1)
+@st.cache_resource(show_spinner=False)
 def load_attributes(active_zip: Path, closed_zip: Path) -> pd.DataFrame:
     df_active = _read_zip_csv(active_zip)
     df_closed = _read_zip_csv(closed_zip)
@@ -104,7 +104,7 @@ def load_attributes(active_zip: Path, closed_zip: Path) -> pd.DataFrame:
     return df
 
 
-@st.cache_data(show_spinner=False, max_entries=1)
+@st.cache_resource(show_spinner=False)
 def load_branches(branches_zip: Path) -> pd.DataFrame:
     if not branches_zip.exists():
         return pd.DataFrame()
@@ -137,7 +137,7 @@ def load_branches(branches_zip: Path) -> pd.DataFrame:
     return df
 
 
-@st.cache_data(show_spinner=False, max_entries=1)
+@st.cache_resource(show_spinner=False)
 def load_relationships(rel_zip: Path) -> pd.DataFrame:
     df = _read_zip_csv(rel_zip)
     df = _normalize_columns(df)
@@ -189,7 +189,6 @@ def load_relationships(rel_zip: Path) -> pd.DataFrame:
     return df
 
 
-@st.cache_data(show_spinner=False, max_entries=1)
 def expand_relationships_yearly(
     rels: pd.DataFrame,
     min_year: int,
@@ -288,12 +287,13 @@ def expand_relationships_yearly(
     return exp, stats
 
 
+@st.cache_resource(show_spinner=False)
 def load_or_build_relationships_yearly(
-    rels: pd.DataFrame,
     min_year: int,
     max_year: int,
-    rel_zip: Path,
+    rel_zip_str: str,
 ) -> tuple[pd.DataFrame, dict]:
+    rel_zip = Path(rel_zip_str)
     LOCAL_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     parq = LOCAL_CACHE_DIR / f"rels_yearly_{min_year}_{max_year}.parquet"
     meta = LOCAL_CACHE_DIR / f"rels_yearly_{min_year}_{max_year}.json"
@@ -316,6 +316,7 @@ def load_or_build_relationships_yearly(
         except Exception:
             pass
 
+    rels = load_relationships(rel_zip)
     exp, stats = expand_relationships_yearly(rels, min_year, max_year)
     try:
         exp.to_parquet(parq, index=False, compression="zstd")
@@ -333,7 +334,7 @@ def load_or_build_relationships_yearly(
     return exp, stats
 
 
-@st.cache_data(show_spinner=False, max_entries=1)
+@st.cache_resource(show_spinner=False)
 def load_transformations(trans_zip: Path) -> pd.DataFrame:
     if not trans_zip.exists():
         return pd.DataFrame()
@@ -719,8 +720,12 @@ def build_new_subsidiaries_table(
     return out
 
 
-@st.cache_data(show_spinner=False, max_entries=2, ttl=1200)
-def select_attributes_asof(attrs: pd.DataFrame, asof: int, filter_existence: bool = True) -> pd.DataFrame:
+def select_attributes_asof(
+    attrs: pd.DataFrame,
+    asof: int,
+    filter_existence: bool = True,
+    rssd_ids: tuple[int, ...] | None = None,
+) -> pd.DataFrame:
     needed_cols = [
         "ID_RSSD",
         "NM_SHORT",
@@ -745,6 +750,10 @@ def select_attributes_asof(attrs: pd.DataFrame, asof: int, filter_existence: boo
     ]
     needed_cols = [c for c in needed_cols if c in attrs.columns]
     df = attrs[needed_cols].copy()
+    if rssd_ids is not None:
+        if len(rssd_ids) == 0:
+            return pd.DataFrame(columns=needed_cols).set_index(pd.Index([], name="ID_RSSD"))
+        df = df[df["ID_RSSD"].isin([int(x) for x in rssd_ids])]
     valid = (df["DT_START"] <= asof) & (df["DT_END"] >= asof)
     if filter_existence:
         exist_ok = (df["DT_EXIST_CMNC"] == 0) | (df["DT_EXIST_CMNC"] <= asof)
@@ -760,7 +769,6 @@ def select_attributes_asof(attrs: pd.DataFrame, asof: int, filter_existence: boo
     return df.set_index("ID_RSSD", drop=False)
 
 
-@st.cache_data(show_spinner=False, max_entries=6, ttl=1200)
 def select_attributes_best_effort_for_ids(
     attrs: pd.DataFrame,
     asof: int,
@@ -808,7 +816,6 @@ def select_attributes_best_effort_for_ids(
     return df.set_index("ID_RSSD", drop=False)
 
 
-@st.cache_data(show_spinner=False, max_entries=3, ttl=1200)
 def select_relationships_asof(
     rels: pd.DataFrame,
     asof: int,
@@ -968,6 +975,24 @@ def compute_attr_source_counts(
     return counts
 
 
+def select_branches_asof_for_heads(
+    branches: pd.DataFrame,
+    asof: int,
+    head_ids: tuple[int, ...],
+) -> pd.DataFrame:
+    if branches.empty or not head_ids:
+        return pd.DataFrame()
+    df = branches.copy()
+    if "ID_RSSD_HD_OFF" in df.columns:
+        df = df[df["ID_RSSD_HD_OFF"].isin([int(x) for x in head_ids])]
+    valid = (df["DT_START"] <= asof) & (df["DT_END"] >= asof)
+    df = df[valid]
+    if df.empty:
+        return pd.DataFrame()
+    df = df.sort_values(["ID_RSSD", "DT_START"]).drop_duplicates("ID_RSSD", keep="last")
+    return df.set_index("ID_RSSD", drop=False)
+
+
 def compute_subtree_sizes(
     children: dict[int, list[int]],
     root_id: int,
@@ -1038,7 +1063,6 @@ def top_level_diagnostic(
     return pd.DataFrame(rows)
 
 
-@st.cache_data(show_spinner=False, max_entries=1)
 def build_root_universe(
     rels_yearly: pd.DataFrame,
     ctrl_inds=(1,),
@@ -1409,7 +1433,7 @@ def build_pyvis_graph(
 # App UI
 # ----------------------------
 
-st.title("NPW Org-Chart Explorer")
+st.title("BHC Org-Chart Explorer")
 
 # Data checks
 missing = [p for p in [REL_ZIP, ATTR_ACTIVE_ZIP, ATTR_CLOSED_ZIP] if not p.exists()]
@@ -1428,7 +1452,7 @@ if max_year < min_year:
     max_year = min_year
 
 with st.spinner("Preparing yearly relationship panel..."):
-    rels_yearly, rels_quality = load_or_build_relationships_yearly(rels, min_year, max_year, REL_ZIP)
+    rels_yearly, rels_quality = load_or_build_relationships_yearly(min_year, max_year, str(REL_ZIP))
 del rels
 gc.collect()
 
@@ -1466,6 +1490,17 @@ with yr_badge_col:
 """,
         unsafe_allow_html=True,
     )
+
+st.caption("Year dots: hover to see year, click a dot to jump.")
+dot_chunk = 18
+for chunk_start in range(0, len(year_options), dot_chunk):
+    chunk_years = year_options[chunk_start : chunk_start + dot_chunk]
+    dot_cols = st.columns(len(chunk_years), gap="small")
+    for col, dot_year in zip(dot_cols, chunk_years):
+        dot_label = "o" if int(dot_year) == int(st.session_state["selected_year"]) else "."
+        if col.button(dot_label, key=f"year_dot_{dot_year}", help=str(dot_year), width="stretch"):
+            st.session_state["selected_year"] = int(dot_year)
+            st.rerun()
 
 year = int(st.session_state["selected_year"])
 asof = year * 10000 + 1231
@@ -1526,14 +1561,14 @@ auto_tune = st.sidebar.checkbox("Auto tune for screen size", value=True)
 
 def _auto_graph_settings(w: int | None, h: int | None):
     if not w:
-        return 3, 800, True, False, 13, 11, 0.6, 720
+        return 3, 600, True, False, 13, 11, 0.6, 680
     if w < 900:
         return 2, 300, True, False, 11, 10, 0.45, int((h or 720) * 0.7)
     if w < 1200:
-        return 3, 600, True, False, 12, 10, 0.5, int((h or 760) * 0.75)
+        return 3, 500, True, False, 12, 10, 0.5, int((h or 760) * 0.72)
     if w < 1600:
-        return 3, 900, True, False, 13, 11, 0.55, int((h or 820) * 0.78)
-    return 4, 1200, True, False, 14, 12, 0.65, int((h or 880) * 0.8)
+        return 3, 700, True, False, 13, 11, 0.55, int((h or 820) * 0.75)
+    return 4, 900, True, False, 14, 12, 0.65, int((h or 880) * 0.78)
 
 if auto_tune:
     max_depth, max_nodes, show_labels, show_edge_labels, font_size, edge_font_size, arrow_scale, graph_height = _auto_graph_settings(
@@ -1545,7 +1580,7 @@ if auto_tune:
     show_edge_labels = st.sidebar.checkbox("Show edge labels", value=show_edge_labels, disabled=True)
 else:
     max_depth = st.sidebar.slider("Max depth", min_value=1, max_value=6, value=3)
-    max_nodes = st.sidebar.slider("Max nodes", min_value=50, max_value=2000, value=800, step=50)
+    max_nodes = st.sidebar.slider("Max nodes", min_value=50, max_value=2000, value=600, step=50)
     show_labels = st.sidebar.checkbox("Show labels", value=True)
     show_edge_labels = st.sidebar.checkbox("Show edge labels", value=False)
     font_size = 13
@@ -1573,25 +1608,37 @@ with st.sidebar.expander("Relationship data checks", expanded=False):
         f"out_of_range={rels_quality.get('dropped_out_of_range', 0)}"
     )
 
-# As-of data
-attrs_asof = select_attributes_asof(attrs, asof, filter_existence=filter_existence)
-attrs_asof_loose = select_attributes_asof(attrs, asof, filter_existence=False)
+# Static auxiliary data
 trans = load_transformations(TRANSFORM_ZIP)
 
-with st.spinner("Computing top-level organizations across all years..."):
-    root_ids_all_years, root_universe_stats = build_root_universe(
-        rels_yearly,
-        ctrl_inds=(1,),
-        reg_inds=(1, 2),
-        direct_reln_lvls=(1,),
-        all_reln_lvls=(1, 2, 3, 4),
-    )
+root_universe_key = (int(min_year), int(max_year), int(len(rels_yearly)))
+if st.session_state.get("_root_universe_key") != root_universe_key:
+    with st.spinner("Computing top-level organizations across all years..."):
+        _root_ids_all_years, _root_universe_stats = build_root_universe(
+            rels_yearly,
+            ctrl_inds=(1,),
+            reg_inds=(1, 2),
+            direct_reln_lvls=(1,),
+            all_reln_lvls=(1, 2, 3, 4),
+        )
+    st.session_state["_root_universe_key"] = root_universe_key
+    st.session_state["_root_ids_all_years"] = _root_ids_all_years
+    st.session_state["_root_universe_stats"] = _root_universe_stats
+
+root_ids_all_years = st.session_state.get("_root_ids_all_years", [])
+root_universe_stats = st.session_state.get("_root_universe_stats", {})
 
 top20_ids_set = {int(x["rssd_id"]) for x in TOP20_BHCS}
 
 root_ids_index = pd.Index(np.asarray(root_ids_all_years, dtype=np.int32), name="ID_RSSD")
+root_ids_tuple = tuple(int(x) for x in root_ids_all_years)
 roots_catalog = org_catalog.reindex(root_ids_index)
-roots_asof = attrs_asof.reindex(root_ids_index)
+roots_asof = select_attributes_asof(
+    attrs,
+    asof,
+    filter_existence=filter_existence,
+    rssd_ids=root_ids_tuple,
+).reindex(root_ids_index)
 roots = roots_asof.combine_first(roots_catalog)
 if "ID_RSSD" in roots.columns:
     roots["ID_RSSD"] = (
@@ -1717,11 +1764,30 @@ with st.sidebar.expander("Selected organization panel", expanded=False):
         }
     )
 
-branches_asof = pd.DataFrame()
-if include_branches:
-    branches = load_branches(ATTR_BRANCHES_ZIP)
-    if not branches.empty:
-        branches_asof = select_attributes_asof(branches, asof, filter_existence=False)
+# Base reachable set (used for focus options)
+base_reachable, base_depths, base_children, base_truncated = get_descendants(
+    rels_asof, graph_root_id, max_depth=max_depth, max_nodes=max_nodes
+)
+reachable_ids_tuple = tuple(sorted(int(x) for x in base_reachable))
+
+# Keep as-of attributes constrained to the current graph node universe.
+attrs_asof = select_attributes_asof(
+    attrs,
+    asof,
+    filter_existence=filter_existence,
+    rssd_ids=reachable_ids_tuple,
+)
+attrs_asof_loose = select_attributes_asof(
+    attrs,
+    asof,
+    filter_existence=False,
+    rssd_ids=reachable_ids_tuple,
+)
+attrs_best_effort = select_attributes_best_effort_for_ids(attrs, asof, reachable_ids_tuple)
+attrs_graph = attrs_asof.combine_first(attrs_asof_loose)
+if not attrs_best_effort.empty:
+    attrs_graph = attrs_graph.combine_first(attrs_best_effort)
+attr_source_counts_base = compute_attr_source_counts(base_reachable, attrs_asof, attrs_asof_loose, attrs_best_effort)
 
 if graph_root_id not in attrs_asof_loose.index:
     st.warning(
@@ -1733,16 +1799,12 @@ elif graph_root_id not in attrs_asof.index and filter_existence:
         "Selected organization exists in attributes for this year but is filtered out by existence-date rules."
     )
 
-# Base reachable set (used for focus options)
-base_reachable, base_depths, base_children, base_truncated = get_descendants(
-    rels_asof, graph_root_id, max_depth=max_depth, max_nodes=max_nodes
-)
-reachable_ids_tuple = tuple(sorted(int(x) for x in base_reachable))
-attrs_best_effort = select_attributes_best_effort_for_ids(attrs, asof, reachable_ids_tuple)
-attrs_graph = attrs_asof.combine_first(attrs_asof_loose)
-if not attrs_best_effort.empty:
-    attrs_graph = attrs_graph.combine_first(attrs_best_effort)
-attr_source_counts_base = compute_attr_source_counts(base_reachable, attrs_asof, attrs_asof_loose, attrs_best_effort)
+branches_asof = pd.DataFrame()
+if include_branches:
+    branches = load_branches(ATTR_BRANCHES_ZIP)
+    if not branches.empty:
+        branches_asof = select_branches_asof_for_heads(branches, asof, reachable_ids_tuple)
+
 with st.sidebar.expander("Type mapping coverage", expanded=False):
     st.write(
         {
@@ -1796,11 +1858,26 @@ if year > min_year:
     if graph_root_id in new_nodes_full:
         new_nodes_full.remove(graph_root_id)
 
+new_ids_tuple = tuple(sorted(int(x) for x in new_nodes_full))
+attrs_new_asof = select_attributes_asof(
+    attrs,
+    asof,
+    filter_existence=filter_existence,
+    rssd_ids=new_ids_tuple,
+)
+attrs_new_asof_loose = select_attributes_asof(
+    attrs,
+    asof,
+    filter_existence=False,
+    rssd_ids=new_ids_tuple,
+)
+attrs_new_best = select_attributes_best_effort_for_ids(attrs, asof, new_ids_tuple)
+
 new_df = build_new_subsidiaries_table(
     new_nodes_full,
-    attrs_asof,
-    attrs_asof_loose,
-    attrs_best_effort,
+    attrs_new_asof,
+    attrs_new_asof_loose,
+    attrs_new_best,
     name_map,
 )
 new_nodes = set(new_nodes_full)
