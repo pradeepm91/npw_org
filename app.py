@@ -24,7 +24,8 @@ st.set_page_config(page_title="NPW Org-Chart Explorer", layout="wide")
 # ----------------------------
 
 def _to_int(series: pd.Series, default: int = 0) -> pd.Series:
-    return pd.to_numeric(series, errors="coerce").fillna(default).astype(int)
+    # Keep integer columns compact for Streamlit Cloud memory limits.
+    return pd.to_numeric(series, errors="coerce").fillna(default).astype(np.int32)
 
 
 def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -40,7 +41,7 @@ def _read_zip_csv(zip_path: Path) -> pd.DataFrame:
             return pd.read_csv(f, low_memory=False)
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, max_entries=1)
 def load_attributes(active_zip: Path, closed_zip: Path) -> pd.DataFrame:
     df_active = _read_zip_csv(active_zip)
     df_closed = _read_zip_csv(closed_zip)
@@ -99,7 +100,7 @@ def load_attributes(active_zip: Path, closed_zip: Path) -> pd.DataFrame:
     return df
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, max_entries=1)
 def load_branches(branches_zip: Path) -> pd.DataFrame:
     if not branches_zip.exists():
         return pd.DataFrame()
@@ -132,7 +133,7 @@ def load_branches(branches_zip: Path) -> pd.DataFrame:
     return df
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, max_entries=1)
 def load_relationships(rel_zip: Path) -> pd.DataFrame:
     df = _read_zip_csv(rel_zip)
     df = _normalize_columns(df)
@@ -184,7 +185,7 @@ def load_relationships(rel_zip: Path) -> pd.DataFrame:
     return df
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, max_entries=1)
 def expand_relationships_yearly(
     rels: pd.DataFrame,
     min_year: int,
@@ -256,7 +257,7 @@ def expand_relationships_yearly(
     return exp, stats
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, max_entries=1)
 def load_transformations(trans_zip: Path) -> pd.DataFrame:
     if not trans_zip.exists():
         return pd.DataFrame()
@@ -523,7 +524,7 @@ def inject_collapse_js(
     return html.replace("</body>", script + "</body>")
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, max_entries=1)
 def build_org_catalog(attrs: pd.DataFrame) -> pd.DataFrame:
     df = attrs.copy()
     if "EST_TYPE_CD" in df.columns:
@@ -540,7 +541,7 @@ def build_org_catalog(attrs: pd.DataFrame) -> pd.DataFrame:
     return df.set_index("ID_RSSD", drop=False)
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, max_entries=1)
 def build_entity_name_lookup(attrs: pd.DataFrame) -> dict[int, str]:
     cols = [c for c in ["ID_RSSD", "NM_SHORT", "NM_LGL", "DT_START", "DT_END"] if c in attrs.columns]
     df = attrs[cols].copy()
@@ -626,7 +627,7 @@ def build_new_subsidiaries_table(
     return out
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, max_entries=10)
 def select_attributes_asof(attrs: pd.DataFrame, asof: int, filter_existence: bool = True) -> pd.DataFrame:
     df = attrs.copy()
     valid = (df["DT_START"] <= asof) & (df["DT_END"] >= asof)
@@ -644,7 +645,7 @@ def select_attributes_asof(attrs: pd.DataFrame, asof: int, filter_existence: boo
     return df.set_index("ID_RSSD", drop=False)
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, max_entries=12)
 def select_relationships_asof(
     rels: pd.DataFrame,
     asof: int,
@@ -676,7 +677,7 @@ def select_relationships_asof(
     return df
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, max_entries=1)
 def get_year_bounds(attrs: pd.DataFrame, rels: pd.DataFrame) -> tuple[int, int]:
     def _valid_min_max(series: pd.Series) -> tuple[int, int]:
         s = series[(series > 0) & (series < 99990000)]
@@ -826,7 +827,7 @@ def top_level_diagnostic(
     return pd.DataFrame(rows)
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, max_entries=1)
 def build_root_universe(
     rels_yearly: pd.DataFrame,
     ctrl_inds=(1,),
@@ -874,7 +875,7 @@ def lineage_seed_ids(root_id: int, trans: pd.DataFrame) -> set[int]:
     return seeds
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, max_entries=3)
 def build_bhc_year_panel(
     rels_yearly: pd.DataFrame,
     root_id: int,
