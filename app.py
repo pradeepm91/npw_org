@@ -1491,17 +1491,6 @@ with yr_badge_col:
         unsafe_allow_html=True,
     )
 
-st.caption("Year dots: hover to see year, click a dot to jump.")
-dot_chunk = 18
-for chunk_start in range(0, len(year_options), dot_chunk):
-    chunk_years = year_options[chunk_start : chunk_start + dot_chunk]
-    dot_cols = st.columns(len(chunk_years), gap="small")
-    for col, dot_year in zip(dot_cols, chunk_years):
-        dot_label = "o" if int(dot_year) == int(st.session_state["selected_year"]) else "."
-        if col.button(dot_label, key=f"year_dot_{dot_year}", help=str(dot_year), width="stretch"):
-            st.session_state["selected_year"] = int(dot_year)
-            st.rerun()
-
 year = int(st.session_state["selected_year"])
 asof = year * 10000 + 1231
 prev_asof = (year - 1) * 10000 + 1231
