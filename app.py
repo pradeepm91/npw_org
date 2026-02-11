@@ -19,6 +19,7 @@ ATTR_BRANCHES_ZIP = DATA_DIR / "CSV_ATTRIBUTES_BRANCHES.zip"
 TRANSFORM_ZIP = DATA_DIR / "CSV_TRANSFORMATIONS.zip"
 LOCAL_CACHE_DIR = DATA_DIR / "_cache"
 RELS_CACHE_SCHEMA_VERSION = 2
+TIMELINE_MAX_YEAR = 2025
 
 st.set_page_config(page_title="NPW Org-Chart Explorer", layout="wide")
 
@@ -1422,6 +1423,7 @@ with st.spinner("Loading data..."):
 
 min_year, max_year = get_year_bounds(attrs, rels)
 min_year = max(min_year, 1990)
+max_year = min(max_year, TIMELINE_MAX_YEAR)
 if max_year < min_year:
     max_year = min_year
 
