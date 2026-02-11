@@ -651,6 +651,7 @@ def build_new_subsidiaries_table(
     new_nodes_full: set[int],
     attrs_asof: pd.DataFrame,
     attrs_asof_loose: pd.DataFrame,
+    attrs_best_effort: pd.DataFrame,
     name_lookup: dict[int, str],
 ) -> pd.DataFrame:
     rows = []
@@ -663,18 +664,27 @@ def build_new_subsidiaries_table(
         elif nid in attrs_asof_loose.index:
             row = attrs_asof_loose.loc[nid]
             src = "asof_unfiltered"
+        elif nid in attrs_best_effort.index:
+            row = attrs_best_effort.loc[nid]
+            src = "nearest_history"
         else:
             src = "relationships_only"
 
         name_short = ""
         name_legal = ""
         broad = 0
+        bhc_ind = 0
+        slhc_ind = 0
+        ihc_ind = 0
         city = ""
         state = ""
         if row is not None:
             name_short = str(row.get("NM_SHORT", "") or "").strip()
             name_legal = str(row.get("NM_LGL", "") or "").strip()
             broad = int(row.get("BROAD_REG_CD", 0) or 0)
+            bhc_ind = int(row.get("BHC_IND", 0) or 0)
+            slhc_ind = int(row.get("SLHC_IND", 0) or 0)
+            ihc_ind = int(row.get("IHC_IND", 0) or 0)
             city = str(row.get("CITY", "") or "").strip()
             state = str(row.get("STATE_ABBR_NM", "") or "").strip()
 
@@ -682,13 +692,19 @@ def build_new_subsidiaries_table(
         if not name or name.lower() in {"unknown", "nan", "none"}:
             name = f"RSSD {nid}"
 
+        node_type = (
+            "relationship_only"
+            if src == "relationships_only"
+            else classify_node_category(broad, bhc_ind, slhc_ind, ihc_ind, is_branch=False)
+        )
+
         rows.append(
             {
                 "rssd": nid,
                 "name": name,
                 "name_short": name_short,
                 "name_legal": name_legal,
-                "type": classify_bank(broad),
+                "type": node_type,
                 "city": city,
                 "state": state,
                 "attr_source": src,
@@ -740,6 +756,54 @@ def select_attributes_asof(attrs: pd.DataFrame, asof: int, filter_existence: boo
     df = df[valid]
     df = df.sort_values(["ID_RSSD", "DT_START"])
     df = df.drop_duplicates("ID_RSSD", keep="last")
+    return df.set_index("ID_RSSD", drop=False)
+
+
+@st.cache_data(show_spinner=False, max_entries=6, ttl=1200)
+def select_attributes_best_effort_for_ids(
+    attrs: pd.DataFrame,
+    asof: int,
+    rssd_ids: tuple[int, ...],
+) -> pd.DataFrame:
+    if not rssd_ids:
+        return pd.DataFrame()
+
+    ids = [int(x) for x in rssd_ids]
+    needed_cols = [
+        "ID_RSSD",
+        "NM_SHORT",
+        "NM_LGL",
+        "BROAD_REG_CD",
+        "BHC_IND",
+        "SLHC_IND",
+        "IHC_IND",
+        "DT_START",
+        "DT_END",
+        "CITY",
+        "STATE_ABBR_NM",
+        "ENTITY_TYPE",
+    ]
+    needed_cols = [c for c in needed_cols if c in attrs.columns]
+    df = attrs[attrs["ID_RSSD"].isin(ids)][needed_cols].copy()
+    if df.empty:
+        return df.set_index(pd.Index([], name="ID_RSSD"))
+
+    active_now = (df["DT_START"] <= asof) & (df["DT_END"] >= asof)
+    started = df["DT_START"] <= asof
+    # Rank rows by relevance to as-of:
+    # 0 active on asof, 1 most recent historical row, 2 earliest future row.
+    df["_rank"] = np.where(active_now, 0, np.where(started, 1, 2)).astype(np.int8)
+    df["_pref_start"] = np.where(df["_rank"] == 2, df["DT_START"], -df["DT_START"]).astype(np.int64)
+    broad = df["BROAD_REG_CD"] if "BROAD_REG_CD" in df.columns else pd.Series(0, index=df.index)
+    bhc = df["BHC_IND"] if "BHC_IND" in df.columns else pd.Series(0, index=df.index)
+    slhc = df["SLHC_IND"] if "SLHC_IND" in df.columns else pd.Series(0, index=df.index)
+    ihc = df["IHC_IND"] if "IHC_IND" in df.columns else pd.Series(0, index=df.index)
+    df["_has_type"] = ((broad > 0) | bhc.isin([1, 2]) | (slhc == 1) | (ihc == 1)).astype(np.int8)
+
+    sort_cols = ["ID_RSSD", "_rank", "_pref_start", "_has_type", "DT_END"]
+    sort_asc = [True, True, True, False, False]
+    df = df.sort_values(sort_cols, ascending=sort_asc)
+    df = df.drop_duplicates("ID_RSSD", keep="first")
     return df.set_index("ID_RSSD", drop=False)
 
 
@@ -841,6 +905,7 @@ def bank_color(label: str) -> str:
         "nonbank": "#ff7f0e",
         "holding_company": "#2ca02c",
         "intermediate_holding_company": "#8c564b",
+        "relationship_only": "#bdbdbd",
         "inactive": "#7f7f7f",
         "unknown": "#c7c7c7",
         "branch": "#9467bd",
@@ -876,6 +941,30 @@ def get_descendants(
                     q.clear()
                     break
     return visited, depths, children, truncated
+
+
+def compute_attr_source_counts(
+    node_ids: set[int],
+    attrs_asof: pd.DataFrame,
+    attrs_asof_loose: pd.DataFrame,
+    attrs_best_effort: pd.DataFrame,
+) -> dict[str, int]:
+    counts = {
+        "asof_filtered": 0,
+        "asof_unfiltered": 0,
+        "nearest_history": 0,
+        "relationships_only": 0,
+    }
+    for nid in node_ids:
+        if nid in attrs_asof.index:
+            counts["asof_filtered"] += 1
+        elif nid in attrs_asof_loose.index:
+            counts["asof_unfiltered"] += 1
+        elif nid in attrs_best_effort.index:
+            counts["nearest_history"] += 1
+        else:
+            counts["relationships_only"] += 1
+    return counts
 
 
 def compute_subtree_sizes(
@@ -1204,7 +1293,9 @@ def build_pyvis_graph(
     # Add nodes
     new_nodes = set(new_nodes) & set(reachable)
     for node_id in sorted(reachable):
+        has_attr_row = False
         if node_id in attrs_asof.index:
+            has_attr_row = True
             row = attrs_asof.loc[node_id]
             raw_name = row.get("NM_SHORT") or row.get("NM_LGL") or ""
             name = str(raw_name).strip()
@@ -1239,13 +1330,18 @@ def build_pyvis_graph(
         if not name or str(name).strip().lower() in {"unknown", "nan", "none"}:
             name = f"RSSD {node_id}"
 
-        node_category = classify_node_category(
-            broad,
-            bhc_ind,
-            slhc_ind,
-            ihc_ind,
-            is_branch=(include_branches and node_id in branches_asof.index),
-        )
+        if has_attr_row:
+            node_category = classify_node_category(
+                broad,
+                bhc_ind,
+                slhc_ind,
+                ihc_ind,
+                is_branch=(include_branches and node_id in branches_asof.index),
+            )
+        elif include_branches and node_id in branches_asof.index:
+            node_category = "branch"
+        else:
+            node_category = "relationship_only"
 
         color = bank_color(node_category)
         border_color = "#d62728" if node_id in new_nodes else "#333333"
@@ -1253,10 +1349,14 @@ def build_pyvis_graph(
         size = sizes.get(node_id, 1)
         size = min(60, 8 + math.log1p(size) * 8)
 
+        type_label = node_category.replace("_", " ").title()
+        if node_category == "relationship_only":
+            type_label = "Relationship-only (no attributes row)"
+
         title = (
             f"<b>{name}</b><br>"
             f"RSSD: {node_id}<br>"
-            f"Type: {node_category.replace('_', ' ').title()}<br>"
+            f"Type: {type_label}<br>"
         )
         if entity_type:
             title += f"Entity: {entity_type}<br>"
@@ -1635,6 +1735,21 @@ elif graph_root_id not in attrs_asof.index and filter_existence:
 base_reachable, base_depths, base_children, base_truncated = get_descendants(
     rels_asof, graph_root_id, max_depth=max_depth, max_nodes=max_nodes
 )
+reachable_ids_tuple = tuple(sorted(int(x) for x in base_reachable))
+attrs_best_effort = select_attributes_best_effort_for_ids(attrs, asof, reachable_ids_tuple)
+attrs_graph = attrs_asof.combine_first(attrs_asof_loose)
+if not attrs_best_effort.empty:
+    attrs_graph = attrs_graph.combine_first(attrs_best_effort)
+attr_source_counts_base = compute_attr_source_counts(base_reachable, attrs_asof, attrs_asof_loose, attrs_best_effort)
+with st.sidebar.expander("Type mapping coverage", expanded=False):
+    st.write(
+        {
+            "asof_filtered": int(attr_source_counts_base.get("asof_filtered", 0)),
+            "asof_unfiltered": int(attr_source_counts_base.get("asof_unfiltered", 0)),
+            "nearest_history": int(attr_source_counts_base.get("nearest_history", 0)),
+            "relationships_only": int(attr_source_counts_base.get("relationships_only", 0)),
+        }
+    )
 
 # Focus mode
 st.sidebar.subheader("Select subsidiaries")
@@ -1646,8 +1761,8 @@ if focus_mode:
     focus_options = sorted(base_reachable)
 
     def _focus_label(x: int) -> str:
-        if x in attrs_asof.index:
-            row = attrs_asof.loc[x]
+        if x in attrs_graph.index:
+            row = attrs_graph.loc[x]
             nm = row.get("NM_SHORT") or row.get("NM_LGL") or ""
             nm = str(nm).strip() or name_map.get(x, "")
         else:
@@ -1683,6 +1798,7 @@ new_df = build_new_subsidiaries_table(
     new_nodes_full,
     attrs_asof,
     attrs_asof_loose,
+    attrs_best_effort,
     name_map,
 )
 new_nodes = set(new_nodes_full)
@@ -1692,7 +1808,7 @@ with st.spinner("Building graph..."):
     net, meta = build_pyvis_graph(
         graph_root_id,
         rels_asof,
-        attrs_asof,
+        attrs_graph,
         new_nodes,
         include_branches,
         branches_asof,
@@ -1727,6 +1843,7 @@ legend = """
   <div><span style='display:inline-block;width:12px;height:12px;background:#ff7f0e;border:1px solid #333;'></span> Nonbank</div>
   <div><span style='display:inline-block;width:12px;height:12px;background:#2ca02c;border:1px solid #333;'></span> Holding Company</div>
   <div><span style='display:inline-block;width:12px;height:12px;background:#8c564b;border:1px solid #333;'></span> Intermediate Holding Company</div>
+  <div><span style='display:inline-block;width:12px;height:12px;background:#bdbdbd;border:1px solid #333;'></span> Relationship-only (no attributes row)</div>
   <div><span style='display:inline-block;width:12px;height:12px;background:#7f7f7f;border:1px solid #333;'></span> Inactive</div>
   <div><span style='display:inline-block;width:12px;height:12px;background:#c7c7c7;border:1px solid #333;'></span> Unknown</div>
   <div><span style='display:inline-block;width:12px;height:12px;background:#9467bd;border:1px solid #333;'></span> Branch</div>
@@ -1791,6 +1908,7 @@ with st.expander("New subsidiaries QA checks", expanded=False):
                 "new_subsidiaries": int(len(new_nodes_full)),
                 "attr_source_asof_filtered": int((new_df["attr_source"] == "asof_filtered").sum()) if not new_df.empty else 0,
                 "attr_source_asof_unfiltered": int((new_df["attr_source"] == "asof_unfiltered").sum()) if not new_df.empty else 0,
+                "attr_source_nearest_history": int((new_df["attr_source"] == "nearest_history").sum()) if not new_df.empty else 0,
                 "attr_source_relationships_only": int((new_df["attr_source"] == "relationships_only").sum()) if not new_df.empty else 0,
             }
         )
