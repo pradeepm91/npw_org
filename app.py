@@ -1,4 +1,5 @@
 import datetime as _dt
+import gc
 import json
 import math
 from collections import defaultdict, deque
@@ -16,6 +17,8 @@ ATTR_ACTIVE_ZIP = DATA_DIR / "CSV_ATTRIBUTES_ACTIVE.zip"
 ATTR_CLOSED_ZIP = DATA_DIR / "CSV_ATTRIBUTES_CLOSED.zip"
 ATTR_BRANCHES_ZIP = DATA_DIR / "CSV_ATTRIBUTES_BRANCHES.zip"
 TRANSFORM_ZIP = DATA_DIR / "CSV_TRANSFORMATIONS.zip"
+LOCAL_CACHE_DIR = DATA_DIR / "_cache"
+RELS_CACHE_SCHEMA_VERSION = 2
 
 st.set_page_config(page_title="NPW Org-Chart Explorer", layout="wide")
 
@@ -249,11 +252,83 @@ def expand_relationships_yearly(
     exp = df.iloc[rep_idx].copy()
     exp["YEAR"] = years
 
-    # Keep latest relationship state if multiple rows land in same year for same edge
+    # Keep latest relationship state if multiple rows land in same year for same edge.
     exp = exp.sort_values(["YEAR", "ID_RSSD_PARENT", "ID_RSSD_OFFSPRING", "RELN_LVL", "DT_START"])
     exp = exp.drop_duplicates(["YEAR", "ID_RSSD_PARENT", "ID_RSSD_OFFSPRING", "RELN_LVL"], keep="last")
+
+    # Keep only columns required downstream and downcast types for memory safety.
+    keep_cols = [
+        "YEAR",
+        "ID_RSSD_PARENT",
+        "ID_RSSD_OFFSPRING",
+        "DT_START",
+        "RELN_LVL",
+        "CTRL_IND",
+        "REG_IND",
+        "PCT_EQUITY",
+        "PCT_EQUITY_FORMAT",
+        "PCT_EQUITY_BRACKET",
+        "OTHER_BASIS_IND",
+    ]
+    keep_cols = [c for c in keep_cols if c in exp.columns]
+    exp = exp[keep_cols].copy()
+    for c in ["YEAR", "ID_RSSD_PARENT", "ID_RSSD_OFFSPRING", "DT_START"]:
+        if c in exp.columns:
+            exp[c] = exp[c].astype(np.int32, copy=False)
+    for c in ["RELN_LVL", "CTRL_IND", "REG_IND", "OTHER_BASIS_IND"]:
+        if c in exp.columns:
+            exp[c] = exp[c].astype(np.int16, copy=False)
+    for c in ["PCT_EQUITY_FORMAT", "PCT_EQUITY_BRACKET"]:
+        if c in exp.columns:
+            exp[c] = exp[c].astype("category")
+
     stats["expanded_rows"] = int(len(exp))
 
+    return exp, stats
+
+
+def load_or_build_relationships_yearly(
+    rels: pd.DataFrame,
+    min_year: int,
+    max_year: int,
+    rel_zip: Path,
+) -> tuple[pd.DataFrame, dict]:
+    LOCAL_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    parq = LOCAL_CACHE_DIR / f"rels_yearly_{min_year}_{max_year}.parquet"
+    meta = LOCAL_CACHE_DIR / f"rels_yearly_{min_year}_{max_year}.json"
+
+    src_mtime_ns = int(rel_zip.stat().st_mtime_ns) if rel_zip.exists() else 0
+    src_size = int(rel_zip.stat().st_size) if rel_zip.exists() else 0
+
+    if parq.exists() and meta.exists():
+        try:
+            meta_obj = json.loads(meta.read_text(encoding="utf-8"))
+            if (
+                int(meta_obj.get("schema_version", -1)) == RELS_CACHE_SCHEMA_VERSION
+                and int(meta_obj.get("source_mtime_ns", -1)) == src_mtime_ns
+                and int(meta_obj.get("source_size", -1)) == src_size
+                and int(meta_obj.get("min_year", -1)) == int(min_year)
+                and int(meta_obj.get("max_year", -1)) == int(max_year)
+            ):
+                cached = pd.read_parquet(parq)
+                return cached, dict(meta_obj.get("stats", {}))
+        except Exception:
+            pass
+
+    exp, stats = expand_relationships_yearly(rels, min_year, max_year)
+    try:
+        exp.to_parquet(parq, index=False, compression="zstd")
+        meta_obj = {
+            "schema_version": RELS_CACHE_SCHEMA_VERSION,
+            "source_mtime_ns": src_mtime_ns,
+            "source_size": src_size,
+            "min_year": int(min_year),
+            "max_year": int(max_year),
+            "stats": stats,
+        }
+        meta.write_text(json.dumps(meta_obj), encoding="utf-8")
+    except Exception:
+        pass
     return exp, stats
 
 
@@ -627,9 +702,32 @@ def build_new_subsidiaries_table(
     return out
 
 
-@st.cache_data(show_spinner=False, max_entries=10)
+@st.cache_data(show_spinner=False, max_entries=2, ttl=1200)
 def select_attributes_asof(attrs: pd.DataFrame, asof: int, filter_existence: bool = True) -> pd.DataFrame:
-    df = attrs.copy()
+    needed_cols = [
+        "ID_RSSD",
+        "NM_SHORT",
+        "NM_LGL",
+        "BROAD_REG_CD",
+        "BHC_IND",
+        "SLHC_IND",
+        "IHC_IND",
+        "EST_TYPE_CD",
+        "DOMESTIC_IND",
+        "DT_START",
+        "DT_END",
+        "DT_EXIST_CMNC",
+        "DT_EXIST_TERM",
+        "BANK_CNT",
+        "CITY",
+        "STATE_ABBR_NM",
+        "ENTITY_TYPE",
+        "CHTR_TYPE_CD",
+        "ORG_TYPE_CD",
+        "ID_RSSD_HD_OFF",
+    ]
+    needed_cols = [c for c in needed_cols if c in attrs.columns]
+    df = attrs[needed_cols].copy()
     valid = (df["DT_START"] <= asof) & (df["DT_END"] >= asof)
     if filter_existence:
         exist_ok = (df["DT_EXIST_CMNC"] == 0) | (df["DT_EXIST_CMNC"] <= asof)
@@ -645,7 +743,7 @@ def select_attributes_asof(attrs: pd.DataFrame, asof: int, filter_existence: boo
     return df.set_index("ID_RSSD", drop=False)
 
 
-@st.cache_data(show_spinner=False, max_entries=12)
+@st.cache_data(show_spinner=False, max_entries=3, ttl=1200)
 def select_relationships_asof(
     rels: pd.DataFrame,
     asof: int,
@@ -715,11 +813,34 @@ def classify_bank(broad_reg_cd: int) -> str:
     return "unknown"
 
 
+def classify_node_category(
+    broad_reg_cd: int,
+    bhc_ind: int,
+    slhc_ind: int,
+    ihc_ind: int,
+    is_branch: bool = False,
+) -> str:
+    if is_branch:
+        return "branch"
+    base = classify_bank(int(broad_reg_cd or 0))
+    # Bank color takes priority even if flagged as holding/intermediate.
+    if base == "bank":
+        return "bank"
+    if base in {"nonbank", "unknown"}:
+        if int(ihc_ind or 0) == 1:
+            return "intermediate_holding_company"
+        if int(bhc_ind or 0) in {1, 2} or int(slhc_ind or 0) == 1:
+            return "holding_company"
+    return base
+
+
 def bank_color(label: str) -> str:
     return {
         "bank": "#1f77b4",
         "other_depository": "#17becf",
         "nonbank": "#ff7f0e",
+        "holding_company": "#2ca02c",
+        "intermediate_holding_company": "#8c564b",
         "inactive": "#7f7f7f",
         "unknown": "#c7c7c7",
         "branch": "#9467bd",
@@ -875,7 +996,7 @@ def lineage_seed_ids(root_id: int, trans: pd.DataFrame) -> set[int]:
     return seeds
 
 
-@st.cache_data(show_spinner=False, max_entries=3)
+@st.cache_data(show_spinner=False, max_entries=1)
 def build_bhc_year_panel(
     rels_yearly: pd.DataFrame,
     root_id: int,
@@ -1042,7 +1163,14 @@ def build_pyvis_graph(
     # Subtree sizes for node sizing
     sizes = compute_subtree_sizes(children, root_id, allowed=reachable)
 
-    net = Network(height=f"{graph_height}px", width="100%", directed=True, bgcolor="#ffffff", font_color="#1b1b1b")
+    net = Network(
+        height=f"{graph_height}px",
+        width="100%",
+        directed=True,
+        bgcolor="#ffffff",
+        font_color="#1b1b1b",
+        cdn_resources="remote",
+    )
     net.set_options(
         json.dumps(
             {
@@ -1081,7 +1209,9 @@ def build_pyvis_graph(
             raw_name = row.get("NM_SHORT") or row.get("NM_LGL") or ""
             name = str(raw_name).strip()
             broad = int(row.get("BROAD_REG_CD", 0) or 0)
-            bank_label = classify_bank(broad)
+            bhc_ind = int(row.get("BHC_IND", 0) or 0)
+            slhc_ind = int(row.get("SLHC_IND", 0) or 0)
+            ihc_ind = int(row.get("IHC_IND", 0) or 0)
             city = row.get("CITY", "")
             state = row.get("STATE_ABBR_NM", "")
             entity_type = row.get("ENTITY_TYPE", "")
@@ -1089,13 +1219,19 @@ def build_pyvis_graph(
                 name = str(name_map.get(node_id, "")).strip()
         elif name_map and node_id in name_map:
             name = str(name_map.get(node_id, "")).strip()
-            bank_label = "unknown"
+            broad = 0
+            bhc_ind = 0
+            slhc_ind = 0
+            ihc_ind = 0
             city = ""
             state = ""
             entity_type = ""
         else:
             name = ""
-            bank_label = "unknown"
+            broad = 0
+            bhc_ind = 0
+            slhc_ind = 0
+            ihc_ind = 0
             city = ""
             state = ""
             entity_type = ""
@@ -1103,10 +1239,15 @@ def build_pyvis_graph(
         if not name or str(name).strip().lower() in {"unknown", "nan", "none"}:
             name = f"RSSD {node_id}"
 
-        if include_branches and node_id in branches_asof.index:
-            bank_label = "branch"
+        node_category = classify_node_category(
+            broad,
+            bhc_ind,
+            slhc_ind,
+            ihc_ind,
+            is_branch=(include_branches and node_id in branches_asof.index),
+        )
 
-        color = bank_color(bank_label)
+        color = bank_color(node_category)
         border_color = "#d62728" if node_id in new_nodes else "#333333"
         border_width = 3 if node_id in new_nodes else 1
         size = sizes.get(node_id, 1)
@@ -1115,7 +1256,7 @@ def build_pyvis_graph(
         title = (
             f"<b>{name}</b><br>"
             f"RSSD: {node_id}<br>"
-            f"Type: {bank_label}<br>"
+            f"Type: {node_category.replace('_', ' ').title()}<br>"
         )
         if entity_type:
             title += f"Entity: {entity_type}<br>"
@@ -1185,7 +1326,9 @@ if max_year < min_year:
     max_year = min_year
 
 with st.spinner("Preparing yearly relationship panel..."):
-    rels_yearly, rels_quality = expand_relationships_yearly(rels, min_year, max_year)
+    rels_yearly, rels_quality = load_or_build_relationships_yearly(rels, min_year, max_year, REL_ZIP)
+del rels
+gc.collect()
 
 # Top timeline control
 year_options = list(range(min_year, max_year + 1))
@@ -1197,11 +1340,11 @@ if int(st.session_state["selected_year"]) < min_year or int(st.session_state["se
 st.subheader("Timeline")
 yr_prev_col, yr_slider_col, yr_next_col, yr_badge_col = st.columns([0.8, 7.6, 0.8, 1.4], gap="small")
 with yr_prev_col:
-    if st.button("Prev", key="year_prev_btn", use_container_width=True):
+    if st.button("Prev", key="year_prev_btn", width="stretch"):
         st.session_state["selected_year"] = max(min_year, int(st.session_state["selected_year"]) - 1)
 
 with yr_next_col:
-    if st.button("Next", key="year_next_btn", use_container_width=True):
+    if st.button("Next", key="year_next_btn", width="stretch"):
         st.session_state["selected_year"] = min(max_year, int(st.session_state["selected_year"]) + 1)
 
 with yr_slider_col:
@@ -1344,13 +1487,19 @@ with st.spinner("Computing top-level organizations across all years..."):
 
 top20_ids_set = {int(x["rssd_id"]) for x in TOP20_BHCS}
 
-attr_lookup = org_catalog.copy()
-try:
-    attr_lookup.update(attrs_asof)
-except Exception:
-    pass
+root_ids_index = pd.Index(np.asarray(root_ids_all_years, dtype=np.int32), name="ID_RSSD")
+roots_catalog = org_catalog.reindex(root_ids_index)
+roots_asof = attrs_asof.reindex(root_ids_index)
+roots = roots_asof.combine_first(roots_catalog)
+if "ID_RSSD" in roots.columns:
+    roots["ID_RSSD"] = (
+        roots["ID_RSSD"]
+        .fillna(pd.Series(root_ids_index.astype(np.int32), index=root_ids_index))
+        .astype(np.int32)
+    )
+else:
+    roots["ID_RSSD"] = root_ids_index.astype(np.int32)
 
-roots = attr_lookup[attr_lookup["ID_RSSD"].isin(root_ids_all_years)].copy()
 if "EST_TYPE_CD" in roots.columns:
     roots = roots[roots["EST_TYPE_CD"] == 1]
 
@@ -1576,6 +1725,8 @@ legend = """
   <div><span style='display:inline-block;width:12px;height:12px;background:#1f77b4;border:1px solid #333;'></span> Bank</div>
   <div><span style='display:inline-block;width:12px;height:12px;background:#17becf;border:1px solid #333;'></span> Other Depository</div>
   <div><span style='display:inline-block;width:12px;height:12px;background:#ff7f0e;border:1px solid #333;'></span> Nonbank</div>
+  <div><span style='display:inline-block;width:12px;height:12px;background:#2ca02c;border:1px solid #333;'></span> Holding Company</div>
+  <div><span style='display:inline-block;width:12px;height:12px;background:#8c564b;border:1px solid #333;'></span> Intermediate Holding Company</div>
   <div><span style='display:inline-block;width:12px;height:12px;background:#7f7f7f;border:1px solid #333;'></span> Inactive</div>
   <div><span style='display:inline-block;width:12px;height:12px;background:#c7c7c7;border:1px solid #333;'></span> Unknown</div>
   <div><span style='display:inline-block;width:12px;height:12px;background:#9467bd;border:1px solid #333;'></span> Branch</div>
@@ -1609,7 +1760,7 @@ with side_col:
         show_cols = ["rssd", "name", "type", "city", "state", "attr_source"]
         st.dataframe(
             new_df[show_cols],
-            use_container_width=True,
+            width="stretch",
             height=max(320, graph_height - 130),
         )
         missing_name_count = int(new_df["name"].astype(str).str.startswith("RSSD ").sum())
@@ -1656,9 +1807,9 @@ if lineage_mode and lineage_chain:
                     "trnsfm_cd": ev["trnsfm_cd"],
                 }
             )
-        st.dataframe(pd.DataFrame(rows), use_container_width=True)
+        st.dataframe(pd.DataFrame(rows), width="stretch")
 
 with st.expander("JPMorgan top-level diagnostic"):
     diag_years = sorted(set([1990, 1995, 2000, 2005, 2010, 2015, 2020, 2024, year]))
     jpm_diag = top_level_diagnostic(rels_yearly, 1039502, diag_years)
-    st.dataframe(jpm_diag, use_container_width=True)
+    st.dataframe(jpm_diag, width="stretch")
